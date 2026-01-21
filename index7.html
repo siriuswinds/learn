@@ -1,0 +1,780 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>高斯投影-WebGL 画 GeoJSON 行政区（修复边界计算版）</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: sans-serif;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background: #f0f0f0;
+        }
+
+        .error提示 {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 20px;
+            background: white;
+            border: 1px solid #ff4444;
+            border-radius: 8px;
+            color: #ff4444;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="c"></canvas>
+    <div class="error提示" id="errorTip"></div>
+    <script src="earcut.dev.js"></script>
+    <script>
+        // ===================== 配置常量 =====================
+        const CONFIG = {
+            // 渲染相关
+            NORM_SIZE: 400,
+            ANIMATION_DURATION: 300,
+            ZOOM_RANGE: { min: -2, max: 20 },
+            PAN_MARGIN: 100,
+            // 高斯投影参数
+            GAUSS: {
+                CENTRAL_MERIDIAN: 123,
+                FALSE_EASTING: 500000,
+                ELLIPSOID: {
+                    a: 6378137.0,        // 长半轴
+                    e2: 0.00669437999013, // 第一偏心率平方
+                    e2_2: 0.00673949674228// 第二偏心率平方
+                }
+            },
+            // 样式配置
+            STYLE: {
+                fillColor: [0.8, 0.9, 0.95, 0.9],
+                lineColor: [0.1, 0.3, 0.6, 1.0],
+                bgColor: [1.0, 1.0, 1.0, 1.0]
+            }
+        };
+
+        // ===================== 工具函数 =====================
+        const Utils = {
+            /**
+             * 生成投影缓存键（优化版）
+             * @param {number} lng 经度
+             * @param {number} lat 纬度
+             * @returns {string} 缓存键
+             */
+            createCacheKey(lng, lat) {
+                return `${lng.toFixed(6)}_${lat.toFixed(6)}`;
+            },
+
+            /**
+             * 防抖函数
+             * @param {Function} fn 执行函数
+             * @param {number} delay 延迟时间
+             * @returns {Function} 防抖函数
+             */
+            debounce(fn, delay = 16) {
+                let timer = null;
+                return (...args) => {
+                    clearTimeout(timer);
+                    timer = setTimeout(() => fn.apply(this, args), delay);
+                };
+            },
+
+            /**
+             * 显示错误提示
+             * @param {string} msg 错误信息
+             */
+            showError(msg) {
+                const tip = document.getElementById('errorTip');
+                tip.textContent = msg;
+                tip.style.display = 'block';
+                setTimeout(() => tip.style.display = 'none', 3000);
+            }
+        };
+
+        // ===================== 平滑动画类 =====================
+        class SmoothAnimator {
+            constructor(targetObj, duration = CONFIG.ANIMATION_DURATION) {
+                this.target = targetObj;
+                this.duration = duration;
+                this.animationId = null;
+                this.onUpdate = null; // 更新回调
+            }
+
+            /**
+             * 缓动函数 - 入出二次方
+             * @param {number} t 0-1的时间进度
+             * @returns {number} 缓动后的值
+             */
+            easeInOutQuad(t) {
+                return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            }
+
+            /**
+             * 动画到目标值
+             * @param {Object} newValues 目标值对象
+             */
+            animateTo(newValues) {
+                const start = performance.now();
+                const startValues = { ...this.target };
+                const delta = {};
+
+                // 计算差值
+                Object.keys(newValues).forEach(k => {
+                    delta[k] = newValues[k] - startValues[k];
+                });
+
+                // 动画步骤
+                const step = (now) => {
+                    const t = Math.min(1, (now - start) / this.duration);
+                    const ease = this.easeInOutQuad(t);
+                    
+                    Object.keys(delta).forEach(k => {
+                        this.target[k] = startValues[k] + delta[k] * ease;
+                    });
+                    
+                    if (typeof this.onUpdate === 'function') {
+                        this.onUpdate();
+                    }
+                    
+                    if (t < 1) {
+                        this.animationId = requestAnimationFrame(step);
+                    }
+                };
+
+                // 取消之前的动画
+                cancelAnimationFrame(this.animationId);
+                requestAnimationFrame(step);
+            }
+
+            /**
+             * 销毁动画
+             */
+            destroy() {
+                cancelAnimationFrame(this.animationId);
+                this.onUpdate = null;
+            }
+        }
+
+        // ===================== 高斯投影工具类 =====================
+        class GaussProjection {
+            constructor(config = CONFIG.GAUSS) {
+                this.config = config;
+                this.cache = new Map();
+                // 预计算常量，避免重复计算
+                this._precomputeConstants();
+            }
+
+            /**
+             * 预计算高斯投影常量
+             */
+            _precomputeConstants() {
+                const { e2 } = this.config.ELLIPSOID;
+                // 子午线弧长系数
+                this.A0 = 1 + 3 / 4 * e2 + 45 / 64 * e2 ** 2 + 175 / 256 * e2 ** 3 + 11025 / 16384 * e2 ** 4;
+                this.A2 = 1 / 2 * e2 + 15 / 16 * e2 ** 2 + 525 / 512 * e2 ** 3 + 2205 / 2048 * e2 ** 4;
+                this.A4 = 3 / 16 * e2 ** 2 + 105 / 256 * e2 ** 3 + 2205 / 4096 * e2 ** 4;
+                this.A6 = 1 / 32 * e2 ** 3 + 105 / 1024 * e2 ** 4;
+                this.A8 = 5 / 256 * e2 ** 4;
+                // 中央子午线弧度
+                this.CENTRAL_MERIDIAN_RAD = this.config.CENTRAL_MERIDIAN * Math.PI / 180;
+            }
+
+            /**
+             * 计算子午线弧长
+             * @param {number} latRad 纬度（弧度）
+             * @returns {number} 子午线弧长
+             */
+            meridianArcLength(latRad) {
+                const { a, e2 } = this.config.ELLIPSOID;
+                const B = latRad;
+                return a * (1 - e2) * (
+                    this.A0 * B - 
+                    this.A2 * Math.sin(2 * B) + 
+                    this.A4 * Math.sin(4 * B) - 
+                    this.A6 * Math.sin(6 * B) + 
+                    this.A8 * Math.sin(8 * B)
+                );
+            }
+
+            /**
+             * 经纬度转高斯坐标（带缓存）
+             * @param {number} lng 经度
+             * @param {number} lat 纬度
+             * @returns {[number, number]} [x, y] 高斯坐标
+             */
+            lngLatToGK(lng, lat) {
+                // 验证输入有效性
+                if (!isFinite(lng) || !isFinite(lat) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+                    return [NaN, NaN];
+                }
+
+                const key = Utils.createCacheKey(lng, lat);
+                // 优先从缓存获取
+                if (this.cache.has(key)) {
+                    return [...this.cache.get(key)];
+                }
+
+                const latRad = lat * Math.PI / 180;
+                const lngRad = lng * Math.PI / 180;
+                const dLng = lngRad - this.CENTRAL_MERIDIAN_RAD;
+
+                const cosLat = Math.cos(latRad);
+                const sinLat = Math.sin(latRad);
+                const tanLat = Math.tan(latRad);
+                const N = this.config.ELLIPSOID.a / Math.sqrt(1 - this.config.ELLIPSOID.e2 * sinLat * sinLat);
+                const X = this.meridianArcLength(latRad);
+
+                const l = dLng, l2 = l * l, l3 = l2 * l, l4 = l3 * l, l5 = l4 * l;
+                const eta2 = this.config.ELLIPSOID.e2_2 * cosLat * cosLat;
+
+                const x = X + N / 2 * tanLat * Math.pow(cosLat, 2) * l2 +
+                    N / 24 * tanLat * (5 - tanLat * tanLat + 9 * eta2 + 4 * eta2 * eta2) * Math.pow(cosLat, 4) * l4;
+                const y = this.config.FALSE_EASTING + N * cosLat * l + 
+                    N / 6 * (1 - tanLat * tanLat + eta2) * Math.pow(cosLat, 3) * l3 +
+                    N / 120 * (5 - 18 * tanLat * tanLat + Math.pow(tanLat, 4)) * Math.pow(cosLat, 5) * l5;
+
+                const result = [x, y];
+                this.cache.set(key, result);
+                return result;
+            }
+
+            /**
+             * 批量转换经纬度到高斯坐标
+             * @param {Array<[number, number]>} coords 经纬度数组
+             * @returns {Array<[number, number]>} 高斯坐标数组
+             */
+            batchConvert(coords) {
+                return coords.map(([lng, lat]) => this.lngLatToGK(lng, lat)).filter(([x, y]) => isFinite(x) && isFinite(y));
+            }
+
+            /**
+             * 清理缓存
+             */
+            clearCache() {
+                this.cache.clear();
+            }
+        }
+
+        // ===================== 主渲染器类 =====================
+        class GeoJSONRenderer {
+            constructor(canvasId, geojsonUrl) {
+                // 基础初始化
+                this.canvas = document.getElementById(canvasId);
+                this.geojsonUrl = geojsonUrl;
+                this.isInitialized = false;
+
+                // WebGL 上下文
+                this.gl = this._initWebGLContext();
+                if (!this.gl) {
+                    Utils.showError('当前浏览器不支持WebGL2，请更换浏览器重试');
+                    throw new Error('WebGL 不可用');
+                }
+
+                // 投影工具
+                this.projection = new GaussProjection();
+                // 状态管理
+                this.state = {
+                    zoom: 0,
+                    rotateDeg: 0,
+                    centerX: CONFIG.NORM_SIZE / 2,
+                    centerY: CONFIG.NORM_SIZE / 2,
+                    lastX: 0,
+                    lastY: 0,
+                    mouseDown: false
+                };
+                // 数据缓存
+                this.buffers = {
+                    fillVBO: null,
+                    fillIBO: null,
+                    lineVBO: null,
+                    lineIBO: null,
+                    useUint32: false,
+                    fillIndexCount: 0,
+                    lineIndexCount: 0
+                };
+                this.uniforms = {};
+                this.program = null;
+                // 【还原】不提前初始化边界值，改为原始逻辑：收集所有点后计算
+                this.dataBounds = null;
+                this.dataAspectRatio = 1;
+
+                // 动画初始化
+                this.animator = new SmoothAnimator(this.state);
+                this.animator.onUpdate = () => {
+                    this.updateMatrix();
+                    this.render();
+                };
+
+                // 防抖resize处理
+                this._resizeHandler = Utils.debounce(() => this.resizeCanvas(), 16);
+
+                // 初始化流程
+                this._setupGL();
+                this._setupEvents();
+            }
+
+            /**
+             * 初始化WebGL上下文
+             * @returns {WebGL2RenderingContext|null} WebGL上下文
+             */
+            _initWebGLContext() {
+                return this.canvas.getContext('webgl2', {
+                    elementIndexUint: true,
+                    antialias: true,
+                    alpha: true,
+                    preserveDrawingBuffer: false // 减少内存占用
+                }) || this.canvas.getContext('webgl', {
+                    elementIndexUint: true,
+                    antialias: true,
+                    alpha: true
+                });
+            }
+
+            /**
+             * 初始化WebGL程序和着色器
+             */
+            _setupGL() {
+                const gl = this.gl;
+
+                // WebGL基础配置
+                gl.disable(gl.DEPTH_TEST);
+                gl.disable(gl.CULL_FACE);
+                gl.enable(gl.BLEND); // 启用混合，支持透明度
+                gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+                // 着色器源码（保持原始逻辑）
+                const vert = `
+                attribute vec2 aPos;
+                uniform mat4 uTrans;
+                void main(){
+                    gl_Position = uTrans * vec4(aPos.y, aPos.x, 0.0, 1.0);
+                }`;
+                const frag = `
+                precision highp float;
+                uniform vec4 u_color;
+                void main() { 
+                    gl_FragColor = u_color;
+                }`;
+
+                // 创建着色器（保持原始逻辑）
+                const createShader = (type, src) => {
+                    const s = gl.createShader(type);
+                    gl.shaderSource(s, src);
+                    gl.compileShader(s);
+                    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+                        throw gl.getShaderInfoLog(s);
+                    return s;
+                };
+
+                this.program = gl.createProgram();
+                gl.attachShader(this.program, createShader(gl.VERTEX_SHADER, vert));
+                gl.attachShader(this.program, createShader(gl.FRAGMENT_SHADER, frag));
+                gl.linkProgram(this.program);
+                gl.useProgram(this.program);
+
+                this.uniforms.uTrans = gl.getUniformLocation(this.program, 'uTrans');
+                this.uniforms.uColor = gl.getUniformLocation(this.program, 'u_color');
+                this.uniforms.aPos = gl.getAttribLocation(this.program, 'aPos');
+            }
+
+            /**
+             * 设置交互事件
+             */
+            _setupEvents() {
+                let lastTouchDistance = 0;
+                const getEventPos = (e) => {
+                    const rect = this.canvas.getBoundingClientRect();
+                    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+                };
+
+                const handleStart = (e, pos) => {
+                    this.state.mouseDown = true;
+                    this.state.lastX = pos.x;
+                    this.state.lastY = pos.y;
+                };
+
+                const handleMove = (e, pos) => {
+                    if (!this.state.mouseDown) return;
+                    const dx = pos.x - this.state.lastX;
+                    const dy = pos.y - this.state.lastY;
+                    this.state.lastX = pos.x;
+                    this.state.lastY = pos.y;
+
+                    const pixelToNormX = CONFIG.NORM_SIZE / this.canvas.width * Math.pow(2, -this.state.zoom);
+                    const pixelToNormY = CONFIG.NORM_SIZE / this.canvas.height * Math.pow(2, -this.state.zoom);
+
+                    const margin = CONFIG.PAN_MARGIN;
+                    this.state.centerX = Math.max(-margin, Math.min(CONFIG.NORM_SIZE + margin,
+                        this.state.centerX - dx * pixelToNormX));
+                    this.state.centerY = Math.max(-margin, Math.min(CONFIG.NORM_SIZE + margin,
+                        this.state.centerY + dy * pixelToNormY));
+
+                    this.updateMatrix();
+                    this.render();
+                };
+
+                const handleEnd = () => { this.state.mouseDown = false; };
+
+                // 鼠标事件（保持原始逻辑）
+                this.canvas.addEventListener('mousedown', e => {
+                    handleStart(e, getEventPos(e));
+                    e.preventDefault();
+                });
+                this.canvas.addEventListener('mousemove', e => handleMove(e, getEventPos(e)));
+                this.canvas.addEventListener('mouseup', handleEnd);
+                this.canvas.addEventListener('mouseleave', handleEnd);
+
+                // 滚轮缩放（带平滑动画，保留优化）
+                this.canvas.addEventListener('wheel', e => {
+                    e.preventDefault();
+                    const newZoom = Math.max(CONFIG.ZOOM_RANGE.min, Math.min(CONFIG.ZOOM_RANGE.max,
+                        this.state.zoom + (e.deltaY > 0 ? -0.3 : 0.3)));
+                    this.animator.animateTo({ zoom: newZoom });
+
+                    // 保险：动画结束后强制刷新一次
+                    setTimeout(() => this.render(), this.animator.duration + 16);
+                });
+
+                // 触摸事件（保留优化）
+                this.canvas.addEventListener('touchstart', e => {
+                    e.preventDefault();
+                    if (e.touches.length === 1) {
+                        handleStart(e, getEventPos(e.touches[0]));
+                    }
+                });
+                this.canvas.addEventListener('touchmove', e => {
+                    if (e.touches.length === 1) {
+                        e.preventDefault();
+                        handleMove(e, getEventPos(e.touches[0]));
+                    } else if (e.touches.length === 2) {
+                        e.preventDefault();
+                        // 双指缩放
+                        const [t1, t2] = [e.touches[0], e.touches[1]];
+                        const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+                        if (lastTouchDistance > 0) {
+                            const scale = dist / lastTouchDistance;
+                            const newZoom = Math.max(CONFIG.ZOOM_RANGE.min, Math.min(CONFIG.ZOOM_RANGE.max,
+                                this.state.zoom + Math.log2(scale) * 0.5));
+                            this.animator.animateTo({ zoom: newZoom });
+                        }
+                        lastTouchDistance = dist;
+                    }
+                });
+                this.canvas.addEventListener('touchend', e => {
+                    handleEnd();
+                    if (e.touches.length < 2) lastTouchDistance = 0;
+                });
+
+                this.canvas.oncontextmenu = () => false;
+            }
+
+            /**
+             * 加载并解析GeoJSON数据
+             * @returns {Promise<void>}
+             */
+            async loadGeoJSON() {
+                try {
+                    const response = await fetch(this.geojsonUrl);
+                    if (!response.ok) {
+                        throw new Error(`GeoJSON加载失败: ${response.status} ${response.statusText}`);
+                    }
+                    const geojson = await response.json();
+
+                    if (geojson.type !== 'FeatureCollection') {
+                        throw new Error('GeoJSON类型必须是FeatureCollection');
+                    }
+
+                    return geojson;
+                } catch (err) {
+                    Utils.showError(`GeoJSON加载错误: ${err.message}`);
+                    throw err;
+                }
+            }
+
+            /**
+             * 处理GeoJSON坐标数据（核心：还原原始边界计算逻辑）
+             * @param {Object} geojson GeoJSON数据
+             */
+            processGeoJSON(geojson) {
+                // 1. 收集所有坐标（完全还原原始逻辑）
+                const allPoints = [];
+                const walkCoords = (coords) => {
+                    if (Array.isArray(coords[0])) coords.forEach(walkCoords);
+                    else if (coords.length >= 2) {
+                        const [lng, lat] = coords;
+                        if (isFinite(lng) && isFinite(lat)) {
+                            const [x, y] = this.getCachedGK(lng, lat); // 复用投影缓存
+                            if (isFinite(x) && isFinite(y)) allPoints.push([x, y]);
+                        }
+                    }
+                };
+                geojson.features.forEach(f => walkCoords(f.geometry.coordinates));
+                if (allPoints.length === 0) throw new Error('没有有效坐标');
+
+                // 2. 计算边界（完全还原原始逻辑，这是关键修复）
+                const minX = allPoints.reduce((min, p) => Math.min(min, p[0]), Infinity);
+                const maxX = allPoints.reduce((max, p) => Math.max(max, p[0]), -Infinity);
+                const minY = allPoints.reduce((min, p) => Math.min(min, p[1]), Infinity);
+                const maxY = allPoints.reduce((max, p) => Math.max(max, p[1]), -Infinity);
+
+                // 保存边界值
+                this.dataBounds = { minX, maxX, minY, maxY };
+                this.dataAspectRatio = (maxX - minX) / (maxY - minY);
+                const NORM_SCALE = CONFIG.NORM_SIZE / Math.max(maxX - minX, maxY - minY);
+                this.state.centerX = ((minX + maxX) / 2 - minX) * NORM_SCALE;
+                this.state.centerY = ((minY + maxY) / 2 - minY) * NORM_SCALE;
+
+                // 3. 归一化函数（还原原始逻辑）
+                const normalize = (x, y) => [
+                    (x - minX) * NORM_SCALE,
+                    (y - minY) * NORM_SCALE
+                ];
+
+                // 4. 生成几何数据（还原原始逻辑）
+                const fillPositions = [], fillIndices = [];
+                const linePositions = [], lineIndices = [];
+                let vertexIndex = 0;
+
+                const processPolygon = (rings) => {
+                    const flat = earcut.flatten(rings);
+                    const triangles = earcut(flat.vertices, flat.holes, flat.dimensions);
+
+                    // 填充顶点
+                    for (let i = 0; i < flat.vertices.length; i += flat.dimensions) {
+                        const [x, y] = this.getCachedGK(flat.vertices[i], flat.vertices[i + 1]);
+                        fillPositions.push(...normalize(x, y));
+                    }
+                    triangles.forEach(idx => fillIndices.push(vertexIndex + idx));
+
+                    // 线条顶点（使用索引避免重复）
+                    const ringStart = vertexIndex;
+                    const holes = flat.holes || [];
+                    let cursor = 0;
+
+                    for (let r = 0; r < holes.length + 1; r++) {
+                        const end = holes[r] || flat.vertices.length / flat.dimensions;
+                        for (let i = cursor; i < end; i++) {
+                            const [x, y] = this.getCachedGK(
+                                flat.vertices[i * flat.dimensions],
+                                flat.vertices[i * flat.dimensions + 1]
+                            );
+                            linePositions.push(...normalize(x, y));
+                        }
+                        // 闭合线段
+                        if (end > cursor) {
+                            lineIndices.push(ringStart + cursor, ringStart + cursor);
+                            for (let i = cursor; i < end - 1; i++) {
+                                lineIndices.push(ringStart + i, ringStart + i + 1);
+                            }
+                            lineIndices.push(ringStart + end - 1, ringStart + cursor);
+                        }
+                        cursor = end;
+                    }
+                    vertexIndex += flat.vertices.length / flat.dimensions;
+                };
+
+                geojson.features.forEach(f => {
+                    if (f.geometry.type === 'Polygon') processPolygon(f.geometry.coordinates);
+                    else if (f.geometry.type === 'MultiPolygon')
+                        f.geometry.coordinates.forEach(processPolygon);
+                });
+
+                // 5. 创建缓冲区（还原原始逻辑，修复索引长度问题）
+                const gl = this.gl;
+                this.buffers.fillVBO = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.fillVBO);
+                gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(fillPositions), gl.STATIC_DRAW);
+
+                this.buffers.fillIBO = gl.createBuffer();
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.fillIBO);
+                this.buffers.useUint32 = fillIndices.length > 65535;
+                // 修复：保存索引长度（原始代码没有这一步，导致渲染时长度错误）
+                this.buffers.fillIndexCount = fillIndices.length;
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,
+                    this.buffers.useUint32 ? new Uint32Array(fillIndices) : new Uint16Array(fillIndices),
+                    gl.STATIC_DRAW);
+
+                if (linePositions.length > 0) {
+                    this.buffers.lineVBO = gl.createBuffer();
+                    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.lineVBO);
+                    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(linePositions), gl.STATIC_DRAW);
+
+                    this.buffers.lineIBO = gl.createBuffer();
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.lineIBO);
+                    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,
+                        new Uint32Array(lineIndices), gl.STATIC_DRAW);
+                    this.buffers.lineIndexCount = lineIndices.length;
+                }
+            }
+
+            /**
+             * 复用原始的投影缓存方法（保持兼容）
+             * @param {number} lng 经度
+             * @param {number} lat 纬度
+             * @returns {[number, number]} 高斯坐标
+             */
+            getCachedGK(lng, lat) {
+                return this.projection.lngLatToGK(lng, lat);
+            }
+
+            /**
+             * 调整Canvas大小（保留防抖优化）
+             */
+            resizeCanvas() {
+                const dpr = window.devicePixelRatio || 1;
+                const width = Math.floor(this.canvas.clientWidth * dpr);
+                const height = Math.floor(this.canvas.clientHeight * dpr);
+                if (this.canvas.width !== width || this.canvas.height !== height) {
+                    this.canvas.width = width;
+                    this.canvas.height = height;
+                    this.gl.viewport(0, 0, width, height);
+                }
+            }
+
+            /**
+             * 更新变换矩阵（保持原始逻辑）
+             */
+            updateMatrix() {
+                const { zoom, rotateDeg, centerX, centerY } = this.state;
+                const canvasAspectRatio = this.canvas.width / this.canvas.height;
+
+                const baseScale = 2 / CONFIG.NORM_SIZE;
+                const scale = baseScale * Math.pow(2, zoom);
+                const rad = rotateDeg * Math.PI / 180;
+                const cos = Math.cos(rad), sin = Math.sin(rad);
+
+                let scaleX = scale, scaleY = scale;
+                if (this.dataAspectRatio > canvasAspectRatio) {
+                    scaleY *= (canvasAspectRatio / this.dataAspectRatio);
+                } else {
+                    scaleX *= (this.dataAspectRatio / canvasAspectRatio);
+                }
+
+                const m = new Float32Array([
+                    scaleX * cos, scaleX * sin, 0, 0,
+                    -scaleY * sin, scaleY * cos, 0, 0,
+                    0, 0, 1, 0,
+                    -scaleX * centerX, -scaleY * centerY, 0, 1
+                ]);
+
+                this.gl.uniformMatrix4fv(this.uniforms.uTrans, false, m);
+            }
+
+            /**
+             * 渲染场景（修复索引长度获取问题）
+             */
+            render() {
+                const gl = this.gl;
+                this.resizeCanvas();
+
+                gl.clearColor(...CONFIG.STYLE.bgColor);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+                gl.useProgram(this.program);
+
+                // 绘制填充（修复：使用保存的索引长度，而非不存在的fillIBO.length）
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.fillVBO);
+                gl.vertexAttribPointer(this.uniforms.aPos, 2, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(this.uniforms.aPos);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.fillIBO);
+                gl.uniform4f(this.uniforms.uColor, ...CONFIG.STYLE.fillColor);
+                gl.drawElements(gl.TRIANGLES, this.buffers.fillIndexCount,
+                    this.buffers.useUint32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, 0);
+
+                // 绘制线条
+                if (this.buffers.lineVBO) {
+                    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.lineVBO);
+                    gl.vertexAttribPointer(this.uniforms.aPos, 2, gl.FLOAT, false, 0, 0);
+                    gl.uniform4f(this.uniforms.uColor, ...CONFIG.STYLE.lineColor);
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.lineIBO);
+                    gl.drawElements(gl.LINES, this.buffers.lineIndexCount, gl.UNSIGNED_INT, 0);
+                }
+            }
+
+            /**
+             * 初始化渲染器（保留优化，修复流程）
+             * @returns {Promise<void>}
+             */
+            async init() {
+                try {
+                    // 调整Canvas大小
+                    this.resizeCanvas();
+                    
+                    // 加载并处理GeoJSON
+                    const geojson = await this.loadGeoJSON();
+                    this.processGeoJSON(geojson);
+                    
+                    // 更新矩阵并首次渲染
+                    this.updateMatrix();
+                    this.render();
+                    
+                    this.isInitialized = true;
+                    // 绑定resize事件（保留优化）
+                    window.addEventListener('resize', this._resizeHandler);
+                } catch (err) {
+                    console.error('初始化失败:', err);
+                    Utils.showError(`初始化失败: ${err.message}`);
+                    throw err;
+                }
+            }
+
+            /**
+             * 销毁渲染器，释放资源（保留优化）
+             */
+            destroy() {
+                const gl = this.gl;
+
+                // 销毁动画
+                this.animator.destroy();
+
+                // 删除缓冲区
+                Object.values(this.buffers).forEach(buffer => {
+                    if (buffer && gl.isBuffer(buffer)) {
+                        gl.deleteBuffer(buffer);
+                    }
+                });
+
+                // 删除程序
+                if (this.program && gl.isProgram(this.program)) {
+                    gl.deleteProgram(this.program);
+                }
+
+                // 清理事件监听
+                window.removeEventListener('resize', this._resizeHandler);
+                
+                // 清理投影缓存
+                this.projection.clearCache();
+
+                // 重置状态
+                this.isInitialized = false;
+                this.buffers = {};
+                this.uniforms = {};
+            }
+        }
+
+        // ===================== 应用初始化 =====================
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                const renderer = new GeoJSONRenderer('c', 'djq.json');
+                await renderer.init();
+                
+                // 窗口卸载时清理资源
+                window.addEventListener('beforeunload', () => {
+                    renderer.destroy();
+                });
+            } catch (err) {
+                console.error('应用初始化失败:', err);
+                Utils.showError(`应用加载失败: ${err.message}`);
+            }
+        });
+    </script>
+</body>
+</html>
